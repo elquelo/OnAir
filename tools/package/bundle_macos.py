@@ -34,7 +34,7 @@ def rpaths(path):
 SEARCH = []
 if os.environ.get("ONAIR_RTLSDR_FRAMEWORK"):
     SEARCH.append(os.environ["ONAIR_RTLSDR_FRAMEWORK"])
-SEARCH += ["/opt/homebrew/lib", "/usr/local/lib", "/opt/homebrew/opt"]
+SEARCH += ["/opt/homebrew/lib", "/usr/local/lib", "/opt/homebrew/opt", "/opt/local/lib"]   # /opt/local: MacPorts
 def resolve(dep, owner):
     d = os.path.dirname(owner)
     if dep.startswith("@loader_path/"): return os.path.normpath(os.path.join(d, dep[len("@loader_path/"):]))
@@ -69,7 +69,7 @@ OPTIONAL = {"iio": "ADI's libiio package (github.com/analogdevicesinc/libiio/rel
 allow_missing = os.environ.get("ONAIR_ALLOW_MISSING_RADIO_LIBS") == "1"
 links = []
 missing = []
-HOMEBREW_LIB = [p for p in ("/opt/homebrew/lib", "/usr/local/lib") if os.path.isdir(p)]
+HOMEBREW_LIB = [p for p in ("/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib") if os.path.isdir(p)]   # /opt/local: MacPorts
 for stem in list(REQUIRED) + list(OPTIONAL):
     found = False
     for d in HOMEBREW_LIB:
