@@ -126,13 +126,14 @@ void recordingLibraryDevOpen() { gLib.open = true; reload(recordingsDir()); }
 
 // The button in the diagnostics row, and its window while it is open.
 void recordingLibraryUi(App& a) {
-    const std::string dir = recordingsDir();
+    // recordingsDir() creates the folder and writes and deletes a test file each time: not on every frame while the window is closed
     if (ImGui::SmallButton("Library")) {
         gLib.open = !gLib.open;
-        if (gLib.open) reload(dir);
+        if (gLib.open) reload(recordingsDir());
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", "The recordings in the recordings folder: open one as the source, or re-analyse it in a mode");
     if (!gLib.open) return;
+    const std::string dir = recordingsDir();
     firstWindowSize(900 * gUi, 440 * gUi);
     if (!ImGui::Begin("Recording library###reclib", &gLib.open)) { ImGui::End(); return; }
     if (ImGui::Button("Refresh")) reload(dir);
