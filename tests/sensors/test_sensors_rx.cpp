@@ -62,9 +62,37 @@ static SensorsTelemetry run(double rate, double shiftHz, double snrDb, double of
     return t;
 }
 
+// a weak channel, like the SDRplay RSP1B's at -46 dBFS: the fixed 8-bit conversion left the noise under one step and nothing triggered;
+// the digital gain before it has to bring the same Nexus message back, with the level in the list still the one before the gain
+static SensorsTelemetry runWeak(double scale, double snrDb) {
+    SensorsReceiver rx;
+    rx.configure(250e3);
+    std::vector<cf32> x = sig(sensorsNexusPulses(0x6a, 1, true, 21.4, 47, 12), 250e3, 0, snrDb);
+    for (auto& v : x) v *= (float)scale;
+    // two seconds of the same noise first, as a radio that has been running: the gain learns the floor before the burst
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const double sigma = std::sqrt(0.5 * 0.5 / 2 / std::pow(10.0, snrDb / 10.0) / 2) * scale;
+    std::vector<cf32> lead(500000);
+    for (auto& v : lead) v = cf32(nd(rng) * (float)sigma, nd(rng) * (float)sigma);
+    feedAll(rx, lead);
+    feedAll(rx, x);
+    SensorsTelemetry t;
+    rx.telemetry(t, 0);
+    return t;
+}
+
 int main() {
     const ModeTuning mt = sensorsTuning();
     CHECK(mt.stdMode == 243 && std::string(mt.id) == "sensors" && mt.defMhz == 433.92 && mt.sampleRate == 250e3, "defaults: 433.92 MHz at 250 kHz");
+
+    // weak input (the RSP1B case): -46 dBFS channel noise, a burst 20 dB over it
+    {
+        const SensorsTelemetry t = runWeak(0.01, 20);
+        nexusOk(t, "weak channel (x0.01, 20 dB)");
+        const SensorsTelemetry t2 = runWeak(0.004, 20);
+        nexusOk(t2, "very weak channel (x0.004, 20 dB)");
+    }
 
     // the decoder set
     {

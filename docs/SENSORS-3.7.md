@@ -12,6 +12,11 @@ discriminator), its pulse slicers (PWM, PPM, Manchester, DMC, PCM / NRZ / RZ, PI
 history, exports, the unknown signal analyser, custom decoders and the mode integration. **It does not decode "every sensor"**: it decodes the
 protocols listed below, and only those; a sensor of another make shows up in "Unknown signals" at best.
 
+**Weak input (4.3).** The pulse detector is rtl_433's and works on 8-bit samples. A radio that delivers the channel far below full scale (an SDRplay
+RSP1B at about -46 dBFS) left the noise under one 8-bit step and nothing triggered. The receiver now adds a digital gain before the 8-bit conversion
+(only a boost, up to 50 dB, following the lower quartile of the 256-sample powers of each block, so bursts do not move it) and the detector's auto level
+is on. The log says "weak input, digital gain +N dB" when it changes by 6 dB or more. The dB column still shows the level before the gain.
+
 ## Screens
 
 - **Sensors**: live list (model, ID, channel, temperature, humidity, pressure, wind, rain, battery, signal level, last heard). Click a row for the history

@@ -174,7 +174,7 @@ struct SensorsReceiver::Impl {
     std::function<void(const std::string&)> jsonCb;
     std::function<int64_t()> clock = wallNow;
     int fskMode = FSK_PULSE_DETECT_OLD;   // classic: 2946 of 3031 rtl_433 test samples pass with it, 2147 with the auto mode of the vendored version
-    bool autoLevel = false;
+    bool autoLevel = true;             // the detector's minimum level follows the noise: a fixed -12 dB suits an RTL-SDR run at high gain, not a radio that delivers weaker samples
     float fixedLevel = 0.0f, minLevel = -12.1442f, minSnr = 9.0f;
     float minLevelAuto = 0, noiseLevel = 0;
     int removeAfter = 0;
@@ -205,6 +205,33 @@ struct SensorsReceiver::Impl {
     std::vector<uint8_t> u8;           // live: the 8-bit IQ gathered for the next block
     double accI = 0, accQ = 0; int accN = 0;
     cf32 rot = cf32(1, 0), rotStep = cf32(1, 0);
+    // digital gain before the 8-bit conversion: a radio like the SDRplay RSP1B delivers the channel at about -46 dBFS, where the noise is
+    // worth under one 8-bit step and the pulse detector never triggers. The gain only boosts (never below 1) and follows the noise floor
+    float agcGain = 1.0f;
+    bool agcWarm = false;
+    double chunkAcc = 0; int chunkN = 0;
+    std::vector<float> chunkP;         // mean power of each 256 samples of the current block (before the gain)
+    float agcDbSaid = 0;
+    float agcDb() const { return 20.0f * std::log10(agcGain); }
+
+    void agcUpdate() {
+        if (chunkP.size() < 8) { chunkP.clear(); return; }
+        // the lower quartile of the chunks: bursts take a few chunks, the noise floor the rest
+        const size_t q = chunkP.size() / 4;
+        std::nth_element(chunkP.begin(), chunkP.begin() + (long)q, chunkP.end());
+        const float P = chunkP[q];
+        chunkP.clear();
+        if (!(P > 1e-8f)) return;      // silence below the resolution of any radio (a synthetic signal): nothing to learn
+        constexpr float kTarget = 2e-4f, kMaxGain = 300.0f;   // noise at about 1.3 steps rms per component (-40 dBFS)
+        const float want = P < kTarget ? std::min(kMaxGain, std::sqrt(kTarget / P)) : 1.0f;
+        if (!agcWarm) { agcGain = want; agcWarm = true; }
+        else agcGain = want > agcGain ? std::min(want, agcGain * 1.5f) : want;
+        if (std::fabs(agcDb() - agcDbSaid) >= 6.0f) {
+            agcDbSaid = agcDb();
+            say(agcDbSaid > 0.5f ? "Sensors: weak input, digital gain +" + std::to_string((int)std::lround(agcDbSaid)) + " dB before the 8-bit conversion"
+                                 : "Sensors: input level is enough, no digital gain");
+        }
+    }
 
     // results
     std::mutex telMu;
@@ -332,7 +359,7 @@ struct SensorsReceiver::Impl {
         dev->count++;
         dev->lastSeen = now;
         dev->json = js;
-        if (curPd) { dev->rssiDb = curPd->rssi_db; dev->snrDb = curPd->snr_db; }
+        if (curPd) { dev->rssiDb = curPd->rssi_db - agcDb(); dev->snrDb = curPd->snr_db; }
         for (const auto& nf : f) {
             bool done = false;
             for (auto& e : dev->latest) if (e.key == nf.key) { e = nf; done = true; break; }
@@ -416,7 +443,7 @@ struct SensorsReceiver::Impl {
         curPd = nullptr;
         {
             std::lock_guard<std::mutex> lk(telMu);
-            lastRssi = p->rssi_db; lastSnr = p->snr_db;
+            lastRssi = p->rssi_db - agcDb(); lastSnr = p->snr_db;
         }
         if (ev <= 0 && eventsInPackage == 0) {
             // a package that nothing took: noise mostly; a clear one goes to the analyser
@@ -439,7 +466,7 @@ struct SensorsReceiver::Impl {
         sensors::analyse(p, fsk, u);
         u.utc = now;
         u.fsk = fsk;
-        u.rssiDb = p->rssi_db; u.snrDb = p->snr_db;
+        u.rssiDb = p->rssi_db - agcDb(); u.snrDb = p->snr_db;
         u.freqMHz = (fsk ? p->freq1_hz : p->centerfreq_hz) / 1e6;
         std::lock_guard<std::mutex> lk(telMu);
         unknown.insert(unknown.begin(), std::move(u));
@@ -543,6 +570,7 @@ void SensorsReceiver::configure(double inputRateHz) {
     s.u8.clear(); s.u8.reserve(1 << 17);
     s.announced = false;
     s.accI = s.accQ = 0; s.accN = 0;
+    s.agcGain = 1.0f; s.agcWarm = false; s.agcDbSaid = 0; s.chunkAcc = 0; s.chunkN = 0; s.chunkP.clear();
     const double w = -2 * math::kPi * s.offsetHz / inputRateHz;
     s.rotStep = cf32((float)std::cos(w), (float)std::sin(w)); s.rot = cf32(1, 0);
     s.say("Sensors: listening, " + std::to_string(s.devs.size()) + " decoders from rtl_433 (OOK and FSK, PWM / PPM / Manchester / PCM), pulse detector at " + std::to_string(s.rate / 1000) + " ksps");
@@ -563,6 +591,7 @@ void SensorsReceiver::reset() {
     baseband_demod_FM_reset(&s.fm);
     pulse_detect_reset(s.pd);
     s.u8.clear(); s.accI = s.accQ = 0; s.accN = 0; s.inputPos = 0; s.nIn = 0;
+    s.agcWarm = false; s.chunkAcc = 0; s.chunkN = 0; s.chunkP.clear();   // a retune changes the noise: the next block sets the gain again
     s.minLevelAuto = s.noiseLevel = 0;
     s.announced = false;   // the first block of the new run is reported at once
     pulse_detect_set_levels(s.pd, 0, s.fixedLevel, s.minLevel, s.minSnr, 0);
@@ -603,19 +632,24 @@ void SensorsReceiver::feed(const cf32* x, size_t n) {
     Impl& s = *p_;
     if (!s.isReady) return;
     const int D = s.decim;
-    const float inv = 127.5f / (float)D;
+    const float invMean = 1.0f / (float)D;
     for (size_t i = 0; i < n; i++) {
         const cf32 v = x[i] * s.rot;
         s.rot *= s.rotStep;
         s.accI += v.real(); s.accQ += v.imag();
         if (++s.accN == D) {
-            const float fi = (float)s.accI * inv + 127.5f, fq = (float)s.accQ * inv + 127.5f;
+            const float mi = (float)s.accI * invMean, mq = (float)s.accQ * invMean;
+            s.chunkAcc += (double)mi * mi + (double)mq * mq;
+            if (++s.chunkN == 256) { s.chunkP.push_back((float)(s.chunkAcc / 256)); s.chunkAcc = 0; s.chunkN = 0; }
+            const float g = 127.5f * s.agcGain;
+            const float fi = mi * g + 127.5f, fq = mq * g + 127.5f;
             s.u8.push_back((uint8_t)std::min(255.f, std::max(0.f, std::floor(fi + 0.5f))));
             s.u8.push_back((uint8_t)std::min(255.f, std::max(0.f, std::floor(fq + 0.5f))));
             s.accI = s.accQ = 0; s.accN = 0;
         }
     }
     if (s.u8.size() / 2 >= 32768) {
+        s.agcUpdate();   // for the next block
         s.process(s.u8.data(), s.u8.size() / 2, s.rate);
         s.u8.clear();
         s.publish();
