@@ -102,9 +102,37 @@ struct SdrplayApi {
     // inside free() on every quit for people who only had the library installed (#319). The service drops a client when its process ends.
     ~SdrplayApi() = default;
     std::string err(sp::ErrT e) { const char* s = GetErrorString ? GetErrorString(e) : nullptr; return s ? s : "error " + std::to_string((int)e); }
+    // sdrplay_api_Open() and sdrplay_api_ApiVersion() wait on a lock in the API's shared memory; a lock left behind by a crashed client
+    // (or a stuck service) makes ApiVersion() block for ever, and this runs on the main thread at start and on every rescan: the window
+    // never appeared ("not responding"). They run on a helper thread now and are given a few seconds; if they do not return, the SDRplay
+    // radios are left out of the list, the helper goes on waiting, and the next rescan finds the result if it came in the meantime.
+    // Restarting the service clears the lock: sudo launchctl kickstart -k system/com.sdrplay.service (macOS).
     bool ensureOpen() {
-        std::lock_guard<std::mutex> lk(mu);
-        if (opened || !ok) return opened;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (opened || !ok) return opened;
+            if (openBusy) return false;   // an earlier call is still waiting for the API
+            openBusy = true;
+        }
+        struct St { std::mutex m; std::condition_variable cv; bool done = false, result = false; };
+        auto st = std::make_shared<St>();
+        std::thread([this, st] {
+            const bool r = openBody();
+            { std::lock_guard<std::mutex> lk(mu); openBusy = false; }
+            { std::lock_guard<std::mutex> lk(st->m); st->done = true; st->result = r; }
+            st->cv.notify_all();
+        }).detach();
+        std::unique_lock<std::mutex> lk(st->m);
+        if (!st->cv.wait_for(lk, std::chrono::seconds(5), [&] { return st->done; })) {
+            DIAG(612904, "The SDRplay API did not answer within 5 seconds (a lock left by an earlier program, or a stuck service), so SDRplay radios are not listed. Restart the SDRplay API service.");
+            fprintf(stderr, "SDRplay API: no answer within 5 s (a stale lock or a stuck service): restart the SDRplay API service (macOS: sudo launchctl kickstart -k system/com.sdrplay.service)\n");
+            fflush(stderr);
+            return false;
+        }
+        return st->result;
+    }
+    // the work of ensureOpen(), on the helper thread; only one runs at a time (openBusy)
+    bool openBody() {
         const sp::ErrT e = Open();
         if (e != sp::Success) {
             if (!warnedService) fprintf(stderr, "SDRplay API found but its service is not running (sdrplay_api_Open: %s): start the \"SDRplay API\" service, or reinstall the SDRplay API from sdrplay.com\n", err(e).c_str());
@@ -132,14 +160,14 @@ struct SdrplayApi {
         if (v > sp::kHeaderVersion + 0.005f) fprintf(stderr, "SDRplay API %.2f (newer than the %.2f OnAir was written for; 3.x keeps its layouts, so it should work)\n", v, sp::kHeaderVersion);
         else fprintf(stderr, "SDRplay API %.2f\n", v);
         fflush(stderr);
-        version = v;
-        opened = true;
+        { std::lock_guard<std::mutex> lk(mu); version = v; opened = true; }
         return true;
     }
     bool hasValidFlag() const { return version > 3.075f; }   // DeviceT.valid exists from 3.08 on
 
 private:
     bool warnedService = false;
+    bool openBusy = false;   // under mu: the helper thread of ensureOpen() is still inside the API
 };
 static SdrplayApi& sdrplayApi() { static SdrplayApi a; return a; }
 
